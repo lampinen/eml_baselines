@@ -5,6 +5,8 @@ from __future__ import division
 import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
+import tensorflow.contrib.slim.python.slim.nets.resnet_v1 as resnet_v1
+
 import os
 import re
 #import cProfile
@@ -12,20 +14,19 @@ from copy import deepcopy
 from itertools import permutations
 from collections import Counter
 
-from polynomials import *
+from mini_imagenet_dataloader import MiniImageNetDataLoader
 from orthogonal_matrices import random_orthogonal
 
 ### Parameters #################################################
 
 config = {
     "run_offset": 0,
-    "num_runs": 3,
+    "num_runs": 1,
 
-    "num_variables": 4,
-    "max_degree": 2,
+    "vision_checkpoint": "./resnet_v1_50.ckpt",
 
-    "num_input": 4, # 4 variables
-    "num_output": 1, # 1 output
+    "way": 5, # how many classes 
+    "shot": 5, # how many shots
 
     "num_hidden": 64,
     "num_hidden_hyper": 512,
@@ -49,14 +50,8 @@ config = {
 
     "lr_decays_every": 100,
     "min_learning_rate": 3e-8,
-    "min_language_learning_rate": 3e-8,
-    "min_meta_learning_rate": 1e-7,
-
-    "refresh_meta_cache_every": 10000, # how many epochs between updates to meta_cache
-    "refresh_mem_buffs_every": 50, # how many epochs between updates to buffers
 
     "max_base_epochs": 4000,
-    "max_new_epochs": 100,
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "train_drop_prob": 0.00, # dropout probability, applied on meta and hyper
@@ -71,93 +66,20 @@ config = {
 
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
-    "restore_checkpoint_path": "/mnt/fs2/lampinen/polynomials/newest_results/basic_ADAM_nobinary_slower/", 
-    "output_dir": "/mnt/fs4/lampinen/polynomials/newest_results/slower_integration/",
+    "restore_checkpoint_path": None, 
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results_%ishot_%iway/",
     "save_every": 20, 
-    "sweep_meta_batch_sizes": [5, 10, 20, 30, 40, 80], # if not None,
-                                                   # eval each at
-                                                   # training ends
 
     "memory_buffer_size": 1024, # How many points for each polynomial are stored
-    "meta_batch_size": 50, # how many meta-learner sees
     "early_stopping_thresh": 0.05,
-    "num_base_tasks": 60, # prior to meta-augmentation
-    "num_new_tasks": 40,
-    "poly_coeff_sd": 2.5,
-    "point_val_range": 1,
-
-    "meta_add_vals": [-3, -1, 1, 3],
-    "meta_mult_vals": [-3, -1, 3],
-    "num_meta_binary_pairs": 60, # for binary tasks like multiplying 
-                                 # polynomials, how many pairs does the 
-                                 # system see?
-    "new_meta_tasks": [],
-    "new_meta_mappings": ["add_%f" % 2., "add_%f" % -2., "mult_%f" % 2., "mult_%f" % -2.],
     
-    "train_language": False, # whether to train language as well (only language
-                            # inputs, for now)
     "train_base": True, 
-    "train_meta": False,
-    "separate_meta_task_network": False, # baseline architecture where meta-task
-                                        # weights aren't shared with basic
-    "lang_drop_prob": 0.0, # dropout on language processing features
-                            # to try to address overfitting
 
     "internal_nonlinearity": tf.nn.leaky_relu,
     "output_nonlinearity": None
 }
 
-poly_fam = polynomial_family(config["num_variables"], config["max_degree"])
-config["variables"] = poly_fam.variables
-
-config["base_meta_tasks"] = ["is_constant_polynomial"] + ["is_intercept_nonzero"] + ["is_%s_relevant" % var for var in config["variables"]]
-
-config["base_meta_mappings"] = ["square"] + ["add_%f" % c for c in config["meta_add_vals"]] + ["mult_%f" % c for c in config["meta_mult_vals"]]
-permutation_mappings = ["permute_" + "".join([str(x) for x in p]) for p in permutations(range(config["num_variables"]))]
-np.random.seed(0)
-np.random.shuffle(permutation_mappings)
-config["base_meta_mappings"] += permutation_mappings[:len(permutation_mappings)//2]
-config["new_meta_mappings"] += permutation_mappings[len(permutation_mappings)//2:]
-
-config["base_meta_binary_funcs"] = []#["binary_sum", "binary_mult"] 
-
-
-# filtering out held-out meta tasks
-config["base_meta_tasks"] = [x for x in config["base_meta_tasks"] if x not in config["new_meta_tasks"]]
-config["meta_mappings"] = [x for x in config["base_meta_mappings"] if x not in config["new_meta_mappings"]]
-
-
-# language
-vocab = ['PAD'] + [str(x) for x in range(10)] + [".", "+", "-", "^"] + poly_fam.variables
-vocab_to_int = dict(zip(vocab, range(len(vocab))))
-
-config["vocab"] = vocab
-
 ### END PARAMATERS (finally) ##################################
-
-def _stringify_polynomial(p):
-    """Helper for printing, etc."""
-    return p.to_symbols(strip_spaces=True)
-
-
-number_regex = re.compile('-?[0-9]+\.[0-9][0-9]')
-def _intify_polynomial(p):
-    """Helper for language inputs"""
-    symbs = p.to_symbols(strip_spaces=False)
-    symbs = re.sub("\+ -", "-", symbs)
-    symbs = symbs.split()
-    ints = []
-    for x in symbs:
-        if number_regex.match(x):
-            ints += [vocab_to_int[ch] for ch in list(x)]
-        else:
-            ints.append(vocab_to_int[x])
-    return ints 
-
-
-def _pad(l, length, pad_token="PAD"):
-    return [pad_token]*(length - len(l)) + l
-
 
 def _save_config(filename, config):
     with open(filename, "w") as fout:
@@ -167,6 +89,17 @@ def _save_config(filename, config):
 
 var_scale_init = tf.contrib.layers.variance_scaling_initializer(factor=1., mode='FAN_AVG')
 
+dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
+                                    way_num=config["way"],
+                                    episode_test_sample_num=15)
+
+dataloader.load_list(phase='all')
+
+#batch = dataloader.get_batch(phase='train', idx=0)
+#for i in range(len(batch)):
+#    print(batch[i].shape)
+#
+#exit()
 
 def get_distinct_random_choices(values, num_choices_per, num_sets,
                                 replace=False):
@@ -178,83 +111,6 @@ def get_distinct_random_choices(values, num_choices_per, num_sets,
             sets.append(candidate_set)
         
     return [np.random.permutation(list(s)) for s in sets]
-
-
-def _get_meta_pairings(base_tasks, meta_tasks, meta_mappings, meta_binary_funcs):
-    """Gets which tasks map to which other tasks under the meta_tasks (i.e. the
-    part of the meta datasets which is precomputable)"""
-    all_meta_tasks = meta_tasks + meta_mappings + meta_binary_funcs
-    meta_pairings = {mt: [] for mt in all_meta_tasks}
-    implied_tasks = []
-    for mt in all_meta_tasks:
-        if mt == "square":
-            for poly in base_tasks: 
-                if poly.my_max_degree**2 > poly.family.max_degree:
-                    continue
-                other = poly ** 2
-                implied_tasks.append(other)
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          _stringify_polynomial(other)))
-        elif mt[:3] == "add":
-            c = float(mt[4:])
-            for poly in base_tasks: 
-                other = poly + c
-                implied_tasks.append(other)
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          _stringify_polynomial(other)))
-        elif mt[:4] == "mult":
-            c = float(mt[5:])
-            for poly in base_tasks: 
-                other = poly * c
-                implied_tasks.append(other)
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          _stringify_polynomial(other)))
-        elif mt[:7] == "permute":
-            perm = [int(c) for c in mt[8:]] 
-            for poly in base_tasks: 
-                other = poly.permute_vars(perm) 
-                implied_tasks.append(other)
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          _stringify_polynomial(other)))
-        elif mt == "is_constant_polynomial":
-            for poly in base_tasks: 
-                truth_val = poly.my_max_degree == 0 
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          1*truth_val))
-        elif mt == "is_intercept_nonzero":
-            for poly in base_tasks: 
-                truth_val = "1" in poly.coefficients and poly.coefficients["1"] != 0.
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          1*truth_val))
-        elif mt[:3] == "is_":
-            var = mt.split("_")[1]
-            for poly in base_tasks: 
-                truth_val = var in poly.relevant_variables 
-                meta_pairings[mt].append((_stringify_polynomial(poly),
-                                          1*truth_val))
-        elif mt[:6] == "binary":
-            operation = mt[7:]
-            if operation not in ["sum", "mult"]:
-                raise ValueError("Unknown meta task: %s" % meta_task)
-            pairings = get_distinct_random_choices(
-                values=base_tasks, num_choices_per=2,
-                num_sets=config["num_meta_binary_pairs"], replace=False)  
-            for poly1, poly2 in pairings:
-                if operation == "sum":
-                    other = poly1 + poly2
-                elif operation == "mult":
-                    if poly1.my_max_degree + poly2.my_max_degree > poly1.family.max_degree:
-                        continue
-                    other = poly1 * poly2
-                implied_tasks.append(other)
-                meta_pairings[mt].append((_stringify_polynomial(poly1),
-                                          _stringify_polynomial(poly2),
-                                          _stringify_polynomial(other)))
-
-        else: 
-            raise ValueError("Unknown meta task: %s" % meta_task)
-
-    return meta_pairings, implied_tasks
 
 
 class memory_buffer(object):
