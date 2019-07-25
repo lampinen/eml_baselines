@@ -29,31 +29,22 @@ config = {
 
     "way": 5, # how many classes 
     "shot": 5, # how many shots
+    "test_sample_num": 10, # how many test examples per class
 
-    "num_hidden": 64,
+    "num_hidden": 128,
     "num_hidden_hyper": 512,
-    "num_hidden_language": 512,
 
-    "num_lstm_layers": 2, # for language processing
-    "max_sentence_len": 20, # Any longer than this will not be trained
     "optimizer": "Adam",
 
-    "init_learning_rate": 3e-5,
-    "init_language_learning_rate": 3e-5,
-    "init_meta_learning_rate": 1e-5,
-
-    "new_init_learning_rate": 1e-7,
-    "new_init_language_learning_rate": 1e-7,
-    "new_init_meta_learning_rate": 1e-7,
+    "init_learning_rate": 1e-4,
 
     "lr_decay": 0.85,
-    "language_lr_decay": 0.8,
-    "meta_lr_decay": 0.85,
 
-    "lr_decays_every": 100,
+    "lr_decays_every": 500,
     "min_learning_rate": 3e-8,
 
-    "max_base_epochs": 4000,
+    "max_epochs": 500000,
+    "batches_per_epoch": 100,
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "train_drop_prob": 0.00, # dropout probability, applied on meta and hyper
@@ -69,17 +60,19 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results_%ishot_%iway/",
-    "save_every": 20, 
-
-    "memory_buffer_size": 1024, # How many points for each polynomial are stored
-    "early_stopping_thresh": 0.05,
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results2_%ishot_%iway/",
+    "eval_every": 500, 
+    "eval_batches": 50,
+    "big_eval_every": 5000, 
+    "big_eval_batches": 200,
+    "save_every": 5000, # how often to save a checkpoint
     
     "train_base": True, 
 
     "internal_nonlinearity": tf.nn.leaky_relu,
     "output_nonlinearity": None
 }
+config["output_dir"] = config["output_dir"] % (config["shot"], config["way"])
 
 ### END PARAMATERS (finally) ##################################
 
@@ -105,14 +98,24 @@ def get_distinct_random_choices(values, num_choices_per, num_sets,
 
 class meta_model(object):
     """A meta-learning model for polynomials."""
-    def __init__(self, config):
+    def __init__(self, config, dataloader):
         """args:
             config: a config dict, see above
+            dataloader: a mini_imagenet data loader
         """
         self.config = config
-        self.meta_batch_size = config["way"] * config["shot"]
-        self.num_output = config["way"]
+        self.dataloader = dataloader
+
+        # bookkeeping
+        way = self.config["way"]
+        shot = self.config["shot"]
+        test_sample_num = self.config["test_sample_num"]
+        self.dataset_length = way * (shot + test_sample_num)
+        self.dataset_train_portion = way * shot
+        self.num_output = way 
         self.tkp = 1. - config["train_drop_prob"] # drop prob -> keep prob
+        self.train_idx = 0 
+        self.eval_idx = {"train": 0, "val": 0, "test": 0}
         
         # network
 
@@ -147,6 +150,7 @@ class meta_model(object):
                                                               is_training=False)
                 if not config["fine_tune_vision"]:
                     resnet_output = tf.stop_gradient(resnet_output)
+                resnet_output = tf.squeeze(resnet_output, axis=[1, 2])
                 vision_result = slim.fully_connected(resnet_output, num_hidden_hyper,
                                                      activation_fn=None)
             return vision_result, resnet_output
@@ -291,15 +295,20 @@ class meta_model(object):
         loss_fn = tf.nn.softmax_cross_entropy_with_logits
         target_argmax = tf.argmax(self.base_target_ph, axis=-1)
 
+        def _compute_accuracy(pred_ints, targ_ints):
+            res = tf.equal(pred_ints, targ_ints)
+            res = tf.reduce_mean(tf.cast(res, tf.float32))
+            return res
+            
         self.base_loss = loss_fn(logits=self.base_output, labels=self.base_target_ph)
         self.total_base_loss = tf.reduce_mean(self.base_loss)
-        self.base_accuracy = tf.reduce_mean(tf.equal(self.base_output_argmax, target_argmax))
+        self.base_accuracy = _compute_accuracy(self.base_output_argmax, target_argmax)
 
         self.base_fed_emb_loss = loss_fn(logits=self.base_output_fed_emb, 
                                          labels=self.base_target_ph)
         self.total_base_fed_emb_loss = tf.reduce_mean(self.base_fed_emb_loss)
-        self.base_accuracy = tf.reduce_mean(
-            tf.equal(self.base_output_fed_emb_argmax, target_argmax))
+        self.base_fed_emb_accuracy = _compute_accuracy(
+            self.base_output_fed_emb_argmax, target_argmax)
 
         if config["optimizer"] == "Adam":
             optimizer = tf.train.AdamOptimizer(self.lr_ph)
@@ -319,410 +328,83 @@ class meta_model(object):
         sess_config.gpu_options.allow_growth = True
         self.sess = tf.Session(config=sess_config)
         self.sess.run(tf.global_variables_initializer())
-        exit()
 
 
     def _default_guess_mask(self):
-        way = self.config["way"]
-        shot = self.config["shot"]
+        dataset_length = self.dataset_length 
+        dataset_train_portion = self.dataset_train_portion
         mask = np.zeros(dataset_length, dtype=np.bool)
-        mask[:way * shot] = True
+        mask[:dataset_train_portion] = True
         return mask
 
 
-    def base_train_step(self, memory_buffer, lr):
-        input_buff, output_buff = memory_buffer.get_memories()
+    def base_train_step(self, batch, lr):
+        train_img, train_label, test_img, test_label = batch
+        vision_inputs = np.concatenate([train_img, test_img], axis=0)
+        targets = np.concatenate([train_label, test_label], axis=0)
         feed_dict = {
-            self.base_input_ph: input_buff,
-            self.guess_input_mask_ph: self._random_guess_mask(self.memory_buffer_size),
-            self.base_target_ph: output_buff,
+            self.base_input_ph: vision_inputs,
+            self.guess_input_mask_ph: self._default_guess_mask(),
+            self.base_target_ph: targets,
             self.keep_prob_ph: self.tkp,
             self.lr_ph: lr
         }
         self.sess.run(self.base_train, feed_dict=feed_dict)
 
 
-    def base_language_train_step(self, intified_task, memory_buffer, lr):
-        input_buff, output_buff = memory_buffer.get_memories()
+    def base_eval(self, batch):
+        train_img, train_label, test_img, test_label = batch
+        vision_inputs = np.concatenate([train_img, test_img], axis=0)
+        targets = np.concatenate([train_label, test_label], axis=0)
         feed_dict = {
-            self.base_input_ph: input_buff,
-            self.language_input_ph: intified_task,
-            self.lang_keep_ph: self.lang_keep_prob,
-            self.base_target_ph: output_buff,
-            self.keep_prob_ph: self.tkp,
-            self.lr_ph: lr
-        }
-        self.sess.run(self.base_lang_train, feed_dict=feed_dict)
-
-
-    def base_eval(self, memory_buffer, meta_batch_size=None):
-        input_buff, output_buff = memory_buffer.get_memories()
-        feed_dict = {
-            self.base_input_ph: input_buff,
-            self.guess_input_mask_ph: self._random_guess_mask(
-                self.memory_buffer_size, meta_batch_size=meta_batch_size),
-            self.base_target_ph: output_buff,
+            self.base_input_ph: vision_inputs,
+            self.guess_input_mask_ph: self._default_guess_mask(),
+            self.base_target_ph: targets,
             self.keep_prob_ph: 1.
         }
-        fetches = [self.total_base_loss]
+        fetches = [self.total_base_loss, self.base_accuracy]
         res = self.sess.run(fetches, feed_dict=feed_dict)
         return res
 
 
-    def run_base_eval(self, include_new=False, sweep_meta_batch_sizes=False):
-        """sweep_meta_batch_sizes: False or a list of meta batch sizes to try"""
-        if include_new:
-            tasks = self.all_base_tasks_with_implied
+    def run_base_eval(self, num_batches=500, include_test=True):
+        phases = ["train", "val"]
+        results = {}
+        if include_test:
+            phases.append("test")
         else:
-            tasks = self.initial_base_tasks_with_implied
+            results["test"] = {"loss": -1,
+                               "accuracy": -1}
+        for phase in phases:
+            loss = 0.
+            accuracy = 0.
+            for _ in range(num_batches):
+                batch = self.dataloader.get_batch(phase=phase, 
+                                                  idx=self.eval_idx[phase])
+                this_loss, this_acc = self.base_eval(batch)
+                loss += this_loss
+                accuracy += this_acc
+                self.eval_idx[phase] += 1
+            loss /= num_batches
+            accuracy /= num_batches
+            results[phase] = {"loss": loss,
+                              "accuracy": accuracy}
 
-        losses = [] 
-        if sweep_meta_batch_sizes:
-            for meta_batch_size in sweep_meta_batch_sizes:
-                this_losses = [] 
-                for task in tasks:
-                    task_str = _stringify_polynomial(task)
-                    memory_buffer = self.memory_buffers[task_str]
-                    res = self.base_eval(memory_buffer, 
-                                         meta_batch_size=meta_batch_size)
-                    this_losses.append(res[0])
-                losses.append(this_losses)
-        else:
-            for task in tasks:
-                task_str = _stringify_polynomial(task)
-                memory_buffer = self.memory_buffers[task_str]
-                res = self.base_eval(memory_buffer)
-                losses.append(res[0])
+        return results 
 
-        names = [_stringify_polynomial(t) for t in tasks]
-        return names, losses
-        
 
-    def base_language_eval(self, intified_task, memory_buffer):
-        input_buff, output_buff = memory_buffer.get_memories()
+    def get_base_embedding(self, batch):
+        train_img, train_label, test_img, test_label = batch
+        vision_inputs = np.concatenate([train_img, test_img], axis=0)
+        targets = np.concatenate([train_label, test_label], axis=0)
         feed_dict = {
-            self.base_input_ph: input_buff,
-            self.language_input_ph: intified_task,
-            self.base_target_ph: output_buff,
-            self.lang_keep_ph: 1.,
+            self.base_input_ph: vision_inputs,
+            self.guess_input_mask_ph: self._default_guess_mask(),
+            self.base_target_ph: targets,
             self.keep_prob_ph: 1.
-        }
-        fetches = [self.total_base_lang_loss]
-        res = self.sess.run(fetches, feed_dict=feed_dict)
-        return res
-
-
-    def run_base_language_eval(self, include_new=False):
-        if include_new:
-            tasks = self.all_base_tasks_with_implied
-        else:
-            tasks = self.initial_base_tasks_with_implied
-
-        losses = [] 
-        names = []
-        for task in tasks:
-            task_str = _stringify_polynomial(task)
-            intified_task = self.task_to_ints[task_str]
-#            print(task_str)
-#            print(intified_task)
-            if intified_task is None:
-                continue
-            memory_buffer = self.memory_buffers[task_str]
-            res = self.base_language_eval(intified_task, memory_buffer)
-            losses.append(res[0])
-            names.append(task_str)
-
-        return names, losses
-
-
-    def base_embedding_eval(self, embedding, memory_buffer):
-        input_buff, output_buff = memory_buffer.get_memories()
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-            self.feed_embedding_ph: embedding,
-            self.base_input_ph: input_buff,
-            self.base_target_ph: output_buff
-        }
-        fetches = [self.total_base_fed_emb_loss]
-        res = self.sess.run(fetches, feed_dict=feed_dict)
-        return res
-
-    
-    def get_base_embedding(self, memory_buffer):
-        input_buff, output_buff = memory_buffer.get_memories()
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-            self.base_input_ph: input_buff,
-            self.guess_input_mask_ph: np.ones([self.memory_buffer_size]),
-            self.base_target_ph: output_buff
         }
         res = self.sess.run(self.guess_base_function_emb, feed_dict=feed_dict)
         return res
-
-
-    def get_language_embedding(self, intified_task):
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-            self.lang_keep_ph: 1.,
-            self.language_input_ph: intified_task
-        }
-        res = self.sess.run(self.language_function_emb, feed_dict=feed_dict)
-        return res
-
-
-    def get_combined_embedding(self, t1_embedding, t2_embedding):
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-            self.meta_input_ph: t1_embedding,
-            self.meta_input_2_ph: t2_embedding
-        }
-        res = self.sess.run(self.combined_meta_inputs, feed_dict=feed_dict)
-        return res
-
-
-    def get_meta_dataset(self, meta_task, include_new=False):
-        x_data = []
-        x2_data = []
-        y_data = []
-        if include_new:
-            this_base_tasks = self.meta_pairings_full[meta_task]
-        else:
-            this_base_tasks = self.meta_pairings_base[meta_task]
-        for this_tuple in this_base_tasks:
-            if len(this_tuple) == 3: # binary_func 
-                task, task2, other = this_tuple
-                task2_buffer = self.memory_buffers[task2]
-                x2_data.append(self.get_base_embedding(task2_buffer)[0, :])
-            else:
-                task, other = this_tuple
-            task_buffer = self.memory_buffers[task]
-            x_data.append(self.get_base_embedding(task_buffer)[0, :])
-            if other in [0, 1]:  # for classification meta tasks
-                y_data.append([other])
-            else:
-                other_buffer = self.memory_buffers[other]
-                y_data.append(self.get_base_embedding(other_buffer)[0, :])
-        if x2_data != []: # binary func
-            return {"x1": np.array(x_data), "x2": np.array(x2_data),
-                    "y": np.array(y_data)}
-        else:
-            return {"x": np.array(x_data), "y": np.array(y_data)}
-
-
-    def refresh_meta_dataset_cache(self, include_new=False):
-        meta_tasks = self.all_base_meta_tasks 
-        if include_new:
-            meta_tasks += self.all_new_meta_tasks 
-
-        for t in meta_tasks:
-            self.meta_dataset_cache[t] = self.get_meta_dataset(t, include_new)
-
-
-    def meta_loss_eval(self, meta_dataset):
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-        }
-        y_data = meta_dataset["y"]
-        if y_data.shape[-1] == 1:
-            feed_dict[self.meta_class_ph] = y_data 
-            fetch = self.total_meta_t_loss
-        else:
-            feed_dict[self.meta_target_ph] = y_data 
-            fetch = self.total_meta_m_loss
-
-        if "x1" in meta_dataset: 
-            feed_dict[self.meta_input_ph] = meta_dataset["x1"]
-            feed_dict[self.meta_input_2_ph] = meta_dataset["x2"]
-            feed_dict[self.guess_input_mask_ph] =  np.ones([len(meta_dataset["x1"])])
-            fetch = self.total_meta_bf_loss
-        else:
-            feed_dict[self.meta_input_ph] = meta_dataset["x"]
-            feed_dict[self.guess_input_mask_ph] =  np.ones([len(meta_dataset["x"])])
-
-        return self.sess.run(fetch, feed_dict=feed_dict)
-        
-
-    def run_meta_loss_eval(self, include_new=False):
-        meta_tasks = self.all_base_meta_tasks 
-        if include_new:
-            meta_tasks = self.all_meta_tasks 
-
-        names = []
-        losses = []
-        for t in meta_tasks:
-            meta_dataset = self.meta_dataset_cache[t]
-            if meta_dataset == {}: # new tasks aren't cached
-                meta_dataset = self.get_meta_dataset(t, include_new) 
-            loss = self.meta_loss_eval(meta_dataset)
-            names.append(t)
-            losses.append(loss)
-
-        return names, losses
-
-
-    def get_meta_embedding(self, meta_dataset):
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-            self.guess_input_mask_ph: np.ones([len(meta_dataset["x"])])
-        }
-        y_data = meta_dataset["y"]
-        if y_data.shape[-1] == 1:
-            feed_dict[self.meta_class_ph] = y_data 
-            fetch = self.guess_meta_t_function_emb
-        else:
-            feed_dict[self.meta_target_ph] = y_data 
-            fetch = self.guess_meta_m_function_emb
-
-        if "x1" in meta_dataset: 
-            feed_dict[self.meta_input_ph] = meta_dataset["x1"]
-            feed_dict[self.meta_input_2_ph] = meta_dataset["x2"]
-            fetch = self.guess_meta_bf_function_emb
-        else:
-            feed_dict[self.meta_input_ph] = meta_dataset["x"]
-
-        return self.sess.run(fetch, feed_dict=feed_dict)
-
-
-    def get_meta_outputs(self, meta_dataset, new_dataset=None):
-        """Get new dataset mapped according to meta_dataset, or just outputs
-        for original dataset if new_dataset is None"""
-        meta_class = meta_dataset["y"].shape[-1] == 1
-
-        if new_dataset is not None:
-            if "x" in meta_dataset:
-                this_x = np.concatenate([meta_dataset["x"], new_dataset["x"]], axis=0)
-                new_x = new_dataset["x"] 
-                this_mask = np.zeros(len(this_x), dtype=np.bool)
-                this_mask[:len(meta_dataset["x"])] = True # use only these to guess
-            else:
-                this_x1 = np.concatenate([meta_dataset["x1"], new_dataset["x1"]], axis=0)
-                this_x2 = np.concatenate([meta_dataset["x2"], new_dataset["x2"]], axis=0)
-                new_x = new_dataset["x1"] # for size only 
-                this_mask = np.zeros(len(this_x1), dtype=np.bool)
-                this_mask[:len(meta_dataset["x1"])] = True # use only these to guess
-
-            if meta_class:
-                this_y = np.concatenate([meta_dataset["y"], np.zeros([len(new_x)])], axis=0)
-            else:
-                this_y = np.concatenate([meta_dataset["y"], np.zeros_like(new_x)], axis=0)
-
-        else:
-            if "x" in meta_dataset:
-                this_x = meta_dataset["x"]
-                this_mask = np.ones(len(this_x), dtype=np.bool)
-            else:
-                this_x1 = meta_dataset["x1"]
-                this_x2 = meta_dataset["x2"]
-                this_mask = np.ones(len(this_x1), dtype=np.bool)
-            this_y = meta_dataset["y"]
-
-        feed_dict = {
-            self.keep_prob_ph: 1.,
-            self.guess_input_mask_ph: this_mask 
-        }
-        if meta_class:
-            feed_dict[self.meta_class_ph] = this_y 
-            this_fetch = self.meta_t_output 
-        else:
-            feed_dict[self.meta_target_ph] = this_y
-            this_fetch = self.meta_m_output 
-
-        if "x1" in meta_dataset: 
-            feed_dict[self.meta_input_ph] = this_x1 
-            feed_dict[self.meta_input_2_ph] = this_x2 
-            fetch = self.meta_bf_output
-        else:
-            feed_dict[self.meta_input_ph] = this_x 
-
-        res = self.sess.run(this_fetch, feed_dict=feed_dict)
-
-        if new_dataset is not None:
-            return res[len(meta_dataset["y"]):, :]
-        else:
-            return res
-
-
-    def run_meta_true_eval(self, include_new=False):
-        """Evaluates true meta loss, i.e. the accuracy of the model produced
-           by the embedding output by the meta task"""
-        if include_new:
-            meta_tasks = self.base_meta_mappings + self.new_meta_mappings
-            meta_pairings = self.meta_pairings_full
-        else:
-            meta_tasks = self.base_meta_mappings
-            meta_pairings = self.meta_pairings_base
-        meta_binary_funcs = self.base_meta_binary_funcs
-
-        names = []
-        losses = []
-        for meta_task in meta_tasks:
-            meta_dataset = self.meta_dataset_cache[meta_task]
-            if meta_dataset == {}: # new tasks aren't cached
-                meta_dataset = self.get_meta_dataset(meta_task, include_new) 
-
-            for task, other in meta_pairings[meta_task]:
-                task_buffer = self.memory_buffers[task]
-                task_embedding = self.get_base_embedding(task_buffer)
-
-                other_buffer = self.memory_buffers[other]
-
-                mapped_embedding = self.get_meta_outputs(
-                    meta_dataset, {"x": task_embedding})
-
-                names.append(meta_task + ":" + task + "->" + other)
-                this_loss = self.base_embedding_eval(mapped_embedding, other_buffer)[0]
-                losses.append(this_loss)
-        for meta_task in meta_binary_funcs:
-            meta_dataset = self.meta_dataset_cache[meta_task]
-            for task1, task2, other in meta_pairings[meta_task]:
-                task1_buffer = self.memory_buffers[task1]
-                task1_embedding = self.get_base_embedding(task1_buffer)
-                task2_buffer = self.memory_buffers[task2]
-                task2_embedding = self.get_base_embedding(task2_buffer)
-
-                other_buffer = self.memory_buffers[other]
-
-                mapped_embedding = self.get_meta_outputs(
-                    meta_dataset, {"x1": task1_embedding,
-                                   "x2": task2_embedding})
-
-                names.append(meta_task + ":" + task1 + ":" + task2 + "->" + other)
-                this_loss = self.base_embedding_eval(mapped_embedding, other_buffer)[0]
-                losses.append(this_loss)
-
-        return names, losses 
-
-
-    def meta_train_step(self, meta_dataset, meta_lr):
-        if "y" not in meta_dataset:
-            print(meta_dataset)
-        y_data = meta_dataset["y"]
-        if "x" in meta_dataset:
-            feed_dict = {
-                self.keep_prob_ph: self.tkp,
-                self.meta_input_ph: meta_dataset["x"],
-                self.guess_input_mask_ph: np.ones([len(meta_dataset["x"])]),
-                self.lr_ph: meta_lr
-            }
-            meta_class = y_data.shape[-1] == 1
-            if meta_class:
-                feed_dict[self.meta_class_ph] = y_data
-                op = self.meta_t_train
-            else:
-                feed_dict[self.meta_target_ph] = y_data
-                op = self.meta_m_train
-        else:
-            feed_dict = {
-                self.keep_prob_ph: self.tkp,
-                self.meta_input_ph: meta_dataset["x1"],
-                self.meta_input_2_ph: meta_dataset["x2"],
-                self.guess_input_mask_ph: np.ones([len(meta_dataset["x1"])]),
-                self.lr_ph: meta_lr
-            }
-            feed_dict[self.meta_target_ph] = y_data
-            op = self.meta_bf_train
-
-        self.sess.run(op, feed_dict=feed_dict)
 
 
     def save_parameters(self, filename):
@@ -733,213 +415,91 @@ class meta_model(object):
         self.saver.restore(self.sess, filename)
 
 
-    def run_training(self, filename_prefix, num_epochs, include_new=False):
-        """Train model on base and meta tasks, if include_new include also
-        the new ones."""
+    def run_training(self, filename_prefix):
+        """Train model"""
         config = self.config
         loss_filename = filename_prefix + "_losses.csv"
-        sweep_filename = filename_prefix + "_sweep_losses.csv"
-        meta_filename = filename_prefix + "_meta_true_losses.csv"
-        lang_filename = filename_prefix + "_language_losses.csv"
-        train_language = config["train_language"]
-        train_base = config["train_base"]
-        train_meta = config["train_meta"]
+        accuracy_filename = filename_prefix + "_accuracies.csv"
 
-        with open(loss_filename, "w") as fout, open(meta_filename, "w") as fout_meta, open(lang_filename, "w") as fout_lang:
-            base_names, base_losses = self.run_base_eval(
-                include_new=include_new)
-            meta_names, meta_losses = self.run_meta_loss_eval(
-                include_new=include_new)
-            meta_true_names, meta_true_losses = self.run_meta_true_eval(
-                include_new=include_new)
+        def write_results(epoch, results, f_loss, f_acc, print_too=True):
+            loss_results = f"{epoch}, {results['train']['loss']}, {results['val']['loss']}, {results['test']['loss']}\n"
+            acc_results = f"{epoch}, {results['train']['accuracy']}, {results['val']['accuracy']}, {results['test']['accuracy']}\n"
+            f_loss.write(loss_results)
+            f_acc.write(acc_results)
+            if print_too:
+                print(loss_results)
+                print(acc_results)
 
-            fout.write("epoch, " + ", ".join(base_names + meta_names) + "\n")
-            fout_meta.write("epoch, " + ", ".join(meta_true_names) + "\n")
+        with open(loss_filename, "w") as f_loss, open(accuracy_filename, "w") as f_acc:
 
-            base_loss_format = ", ".join(["%f" for _ in base_names]) + "\n"
-            loss_format = ", ".join(["%f" for _ in base_names + meta_names]) + "\n"
-            meta_true_format = ", ".join(["%f" for _ in meta_true_names]) + "\n"
-
-            if train_language:
-                (base_lang_names, 
-                 base_lang_losses) = self.run_base_language_eval(
-                    include_new=include_new)
-                lang_loss_format = ", ".join(["%f" for _ in base_lang_names]) + "\n"
-                fout_lang.write("epoch, " + ", ".join(base_lang_names) + "\n")
-
-            s_epoch  = "0, "
-            curr_losses = s_epoch + (loss_format % tuple(
-                base_losses + meta_losses))
-            curr_meta_true = s_epoch + (meta_true_format % tuple(
-                meta_true_losses))
-            fout.write(curr_losses)
-            fout_meta.write(curr_meta_true)
-
-            if train_language:
-                curr_lang_losses = s_epoch + (lang_loss_format % tuple(
-                    base_lang_losses))
-                fout_lang.write(curr_lang_losses)
-
-            if config["sweep_meta_batch_sizes"] is not None:
-                with open(sweep_filename, "w") as fout_sweep:
-                    sweep_names, sweep_losses = self.run_base_eval(
-                        include_new=include_new, sweep_meta_batch_sizes=config["sweep_meta_batch_sizes"])
-                    fout_sweep.write("epoch, size, " + ", ".join(base_names) + "\n")
-                    for i, swept_batch_size in enumerate(config["sweep_meta_batch_sizes"]):
-                        swept_losses = s_epoch + ("%i, " % swept_batch_size) + (base_loss_format % tuple(sweep_losses[i]))
-                        fout_sweep.write(swept_losses)
-
-            if include_new:
-                tasks = self.all_tasks_with_implied
-                learning_rate = config["new_init_learning_rate"]
-                language_learning_rate = config["new_init_language_learning_rate"]
-                meta_learning_rate = config["new_init_meta_learning_rate"]
-            else:
-                tasks = self.all_initial_tasks_with_implied
-                learning_rate = config["init_learning_rate"]
-                language_learning_rate = config["init_language_learning_rate"]
-                meta_learning_rate = config["init_meta_learning_rate"]
-
+            num_epochs = config["max_epochs"]
+            batches_per_epoch = config["batches_per_epoch"]
+            eval_every = config["eval_every"]
+            big_eval_every = config["big_eval_every"]
+            eval_batches = config["eval_batches"]
+            big_eval_batches = config["big_eval_batches"]
             save_every = config["save_every"]
-            early_stopping_thresh = config["early_stopping_thresh"]
+
+            learning_rate = config["init_learning_rate"]
             lr_decays_every = config["lr_decays_every"]
             lr_decay = config["lr_decay"]
-            language_lr_decay = config["language_lr_decay"]
-            meta_lr_decay = config["meta_lr_decay"]
             min_learning_rate = config["min_learning_rate"]
-            min_meta_learning_rate = config["min_meta_learning_rate"]
-            min_language_learning_rate = config["min_language_learning_rate"]
 
+            f_loss.write("epoch, train_loss, val_loss, test_loss\n")
+            f_acc.write("epoch, train_accuracy, val_accuracy, test_accuracy\n")
+            results = self.run_base_eval(num_batches=big_eval_batches)
+            write_results(0, results, f_loss, f_acc)
 
-            self.fill_buffers(num_data_points=config["memory_buffer_size"],
-                              include_new=True)
-            self.refresh_meta_dataset_cache(include_new=include_new)
             for epoch in range(1, num_epochs+1):
-                if epoch % config["refresh_mem_buffs_every"] == 0:
-                    self.fill_buffers(num_data_points=config["memory_buffer_size"],
-                                      include_new=True)
-                if epoch % config["refresh_meta_cache_every"] == 0:
-                    self.refresh_meta_dataset_cache(include_new=include_new)
+                for batch_i in range(batches_per_epoch):
+                    batch = self.dataloader.get_batch(phase="train", 
+                                                      idx=self.train_idx)
+                    self.base_train_step(batch, learning_rate)
 
-                order = np.random.permutation(len(tasks))
-                for task_i in order:
-                    task = tasks[task_i]
-                    if isinstance(task, str):
-                        if train_meta:
-                            dataset = self.meta_dataset_cache[task]
-                            self.meta_train_step(dataset, meta_learning_rate)
+                if epoch % eval_every == 0:
+                    if epoch % big_eval_every == 0: 
+                        num_batches = big_eval_batches
                     else:
-                        str_task = _stringify_polynomial(task)
-                        memory_buffer = self.memory_buffers[str_task]
-                        if train_base:
-                            self.base_train_step(memory_buffer, learning_rate)
-                        if train_language:
-                            intified_task = self.task_to_ints[str_task]
-                            if intified_task is not None:
-                                self.base_language_train_step(
-                                    intified_task, memory_buffer,
-                                    language_learning_rate)
-
+                        num_batches = eval_batches
+                    results = self.run_base_eval(num_batches=num_batches)
+                    write_results(epoch, results, f_loss, f_acc)
 
                 if epoch % save_every == 0:
-                    s_epoch  = "%i, " % epoch
-                    _, base_losses = self.run_base_eval(
-                        include_new=include_new)
-                    _, meta_losses = self.run_meta_loss_eval(
-                        include_new=include_new)
-                    _, meta_true_losses = self.run_meta_true_eval(
-                        include_new=include_new)
-                    curr_losses = s_epoch + (loss_format % tuple(
-                        base_losses + meta_losses))
-                    curr_meta_true = s_epoch + (meta_true_format % tuple(meta_true_losses))
-                    fout.write(curr_losses)
-                    fout_meta.write(curr_meta_true)
-                    if train_language:
-                        (_, base_lang_losses) = self.run_base_language_eval(
-                            include_new=include_new)
-                        curr_lang_losses = s_epoch + (lang_loss_format % tuple(
-                            base_lang_losses))
-                        fout_lang.write(curr_lang_losses)
-                        print(curr_losses, curr_lang_losses)
-                        if np.all(curr_losses < early_stopping_thresh) and np.all(curr_lang_losses < early_stopping_thresh):
-                            print("Early stop!")
-                            break
-                    else:
-                        print(curr_losses)
-                        if np.all(curr_losses < early_stopping_thresh):
-                            print("Early stop!")
-                            break
-
+                    self.save_parameters(filename_prefix + "_checkpoint")
 
                 if epoch % lr_decays_every == 0 and epoch > 0:
                     if learning_rate > min_learning_rate:
                         learning_rate *= lr_decay
 
-                    if meta_learning_rate > min_meta_learning_rate:
-                        meta_learning_rate *= meta_lr_decay
-
-                    if train_language and language_learning_rate > min_language_learning_rate:
-                        language_learning_rate *= language_lr_decay
-
-
-            if config["sweep_meta_batch_sizes"] is not None:
-                with open(sweep_filename, "a") as fout_sweep:
-                    sweep_names, sweep_losses = self.run_base_eval(
-                        include_new=include_new, sweep_meta_batch_sizes=config["sweep_meta_batch_sizes"])
-                    for i, swept_batch_size in enumerate(config["sweep_meta_batch_sizes"]):
-                        swept_losses = s_epoch + ("%i, " % swept_batch_size) + (base_loss_format % tuple(sweep_losses[i]))
-                        fout_sweep.write(swept_losses)
-
 
 
 ## data loading
 
-#dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
-#                                    way_num=config["way"],
-#                                    episode_test_sample_num=15)
-#
-#dataloader.load_list(phase='all')
+dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
+                                    way_num=config["way"],
+                                    episode_test_sample_num=config["test_sample_num"])
 
-#batch = dataloader.get_batch(phase='train', idx=0)
-#for i in range(len(batch)):
-#    print(batch[i].shape)
-#
-#exit()
+dataloader.load_list(phase='all')
 
 ## running stuff
 
 for run_i in range(config["run_offset"], config["run_offset"]+config["num_runs"]):
-    model = meta_model(config)
 
     np.random.seed(run_i)
     tf.set_random_seed(run_i)
 
-    model = meta_model(config)
+    model = meta_model(config, dataloader=dataloader)
 
     filename_prefix = config["output_dir"] + "run%i" % run_i
     print("Now running %s" % filename_prefix)
     _save_config(filename_prefix + "_config.csv", config)
 
-
-#    model.save_embeddings(filename=filename_prefix + "_init_embeddings.csv",
-#                          include_new=False)
     if config["restore_checkpoint_path"] is not None:
         model.restore_parameters(config["restore_checkpoint_path"] + "run%i" % run_i + "_guess_checkpoint")
     else:
-        model.run_training(filename_prefix=filename_prefix,
-                           num_epochs=config["max_base_epochs"],
-                           include_new=False)
-#    cProfile.run('model.run_training(filename_prefix=filename_prefix, num_epochs=config["max_base_epochs"], include_new=False)')
+        model.run_training(filename_prefix=filename_prefix)
 
-    model.save_parameters(filename_prefix + "_guess_checkpoint")
-#    model.save_embeddings(filename=filename_prefix + "_guess_embeddings.csv",
-#                          include_new=True)
-
-    model.run_training(filename_prefix=filename_prefix + "_new",
-                       num_epochs=config["max_new_epochs"],
-                       include_new=True)
-#    cProfile.run('model.run_training(filename_prefix=filename_prefix + "_new", num_epochs=config["max_new_epochs"], include_new=True)')
-    model.save_parameters(filename_prefix + "_final_checkpoint")
+    model.save_parameters(filename_prefix + "_checkpoint")
 
 #    model.save_embeddings(filename=filename_prefix + "_final_embeddings.csv",
 #                          include_new=True)
