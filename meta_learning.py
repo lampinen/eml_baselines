@@ -29,7 +29,9 @@ config = {
 
     "way": 5, # how many classes 
     "shot": 5, # how many shots
-    "test_sample_num": 10, # how many test examples per class
+    "test_sample_num": 5, # how many test examples per class -- restricted by
+                          # gpu memory for how many can efficiently run
+                          
 
     "num_hidden": 128,
     "num_hidden_hyper": 512,
@@ -60,12 +62,12 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results2_%ishot_%iway/",
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results_%ishot_%iway/",
     "eval_every": 500, 
     "eval_batches": 50,
-    "big_eval_every": 5000, 
+    "big_eval_every": 2000, 
     "big_eval_batches": 200,
-    "save_every": 5000, # how often to save a checkpoint
+    "save_every": 2000, # how often to save a checkpoint
     
     "train_base": True, 
 
@@ -112,10 +114,17 @@ class meta_model(object):
         test_sample_num = self.config["test_sample_num"]
         self.dataset_length = way * (shot + test_sample_num)
         self.dataset_train_portion = way * shot
+        self.dataset_test_portion = way * test_sample_num 
         self.num_output = way 
         self.tkp = 1. - config["train_drop_prob"] # drop prob -> keep prob
         self.train_idx = 0 
         self.eval_idx = {"train": 0, "val": 0, "test": 0}
+
+        self.idx_limit = {
+            "train": len(
+                self.dataloader.train_filenames) // self.dataset_length,
+            "val": len(self.dataloader.val_filenames) // self.dataset_length,
+            "test": len(self.dataloader.test_filenames) // self.dataset_length}
         
         # network
 
@@ -385,6 +394,8 @@ class meta_model(object):
                 loss += this_loss
                 accuracy += this_acc
                 self.eval_idx[phase] += 1
+                if self.eval_idx[phase] >= self.idx_limit[phase]: 
+                    self.eval_idx[phase] = 0
             loss /= num_batches
             accuracy /= num_batches
             results[phase] = {"loss": loss,
@@ -455,6 +466,9 @@ class meta_model(object):
                     batch = self.dataloader.get_batch(phase="train", 
                                                       idx=self.train_idx)
                     self.base_train_step(batch, learning_rate)
+                    self.train_idx += 1
+                    if self.train_idx >= self.idx_limit["train"]: 
+                        self.train_idx = 0
 
                 if epoch % eval_every == 0:
                     if epoch % big_eval_every == 0: 
@@ -477,7 +491,11 @@ class meta_model(object):
 
 dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
                                     way_num=config["way"],
-                                    episode_test_sample_num=config["test_sample_num"])
+                                    episode_test_sample_num=15)
+
+dataloader.generate_data_list(phase='train')
+dataloader.generate_data_list(phase='val')
+dataloader.generate_data_list(phase='test')
 
 dataloader.load_list(phase='all')
 
