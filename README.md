@@ -1,3 +1,3 @@
-# polynomial_meta_learning
+#  Embedded Meta-Learning baselines
 
-A functional meta-learning project on learning polynomial functions.
+Baseline results for my EML work.
