@@ -24,6 +24,8 @@ config = {
     "num_runs": 1,
 
     "vision_checkpoint": "./resnet_v1_50.ckpt",
+    "fine_tune_vision": True,
+    "input_size": [84, 84, 3],
 
     "way": 5, # how many classes 
     "shot": 5, # how many shots
@@ -89,18 +91,6 @@ def _save_config(filename, config):
 
 var_scale_init = tf.contrib.layers.variance_scaling_initializer(factor=1., mode='FAN_AVG')
 
-dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
-                                    way_num=config["way"],
-                                    episode_test_sample_num=15)
-
-dataloader.load_list(phase='all')
-
-#batch = dataloader.get_batch(phase='train', idx=0)
-#for i in range(len(batch)):
-#    print(batch[i].shape)
-#
-#exit()
-
 def get_distinct_random_choices(values, num_choices_per, num_sets,
                                 replace=False):
     sets = []
@@ -113,40 +103,6 @@ def get_distinct_random_choices(values, num_choices_per, num_sets,
     return [np.random.permutation(list(s)) for s in sets]
 
 
-class memory_buffer(object):
-    """Essentially a wrapper around numpy arrays that handles inserting and
-    removing."""
-    def __init__(self, length, input_width, outcome_width):
-        self.length = length 
-        self.curr_index = 0 
-        self.input_buffer = np.zeros([length, input_width])
-        self.outcome_buffer = np.zeros([length, outcome_width])
-
-    def insert(self, input_mat, outcome_mat):
-        num_events = len(input_mat)
-        if num_events > self.length:
-            num_events = length
-            self.input_buffer = input_mat[-length:, :]
-            self.outcome_buffer = outcome_mat[-length:, :]
-            self.curr_index = 0.
-            return
-        end_offset = num_events + self.curr_index
-        if end_offset > self.length: 
-            back_off = self.length - end_offset
-            num_to_end = num_events + back_off
-            self.input_buffer[:-back_off, :] = input_mat[num_to_end:, :] 
-            self.outcome_buffer[:-back_off, :] = outcome_mat[num_to_end:, :] 
-        else: 
-            back_off = end_offset
-            num_to_end = num_events
-        self.input_buffer[self.curr_index:back_off, :] = input_mat[:num_to_end, :] 
-        self.outcome_buffer[self.curr_index:back_off, :] = outcome_mat[:num_to_end, :] 
-        self.curr_index = np.abs(back_off)
-
-    def get_memories(self): 
-        return self.input_buffer, self.outcome_buffer
-
-
 class meta_model(object):
     """A meta-learning model for polynomials."""
     def __init__(self, config):
@@ -154,97 +110,18 @@ class meta_model(object):
             config: a config dict, see above
         """
         self.config = config
-        self.memory_buffer_size = config["memory_buffer_size"]
-        self.meta_batch_size = config["meta_batch_size"]
-        self.num_input = config["num_input"]
-        self.num_output = config["num_output"]
+        self.meta_batch_size = config["way"] * config["shot"]
+        self.num_output = config["way"]
         self.tkp = 1. - config["train_drop_prob"] # drop prob -> keep prob
-        self.vocab = config["vocab"]
-        self.vocab_size = len(self.vocab)
-
-        base_tasks = config["base_tasks"]
-        base_meta_tasks = config["base_meta_tasks"]
-        base_meta_mappings = config["base_meta_mappings"]
-        base_meta_binary_funcs = config["base_meta_binary_funcs"]
-
-        new_tasks = config["new_tasks"]
-        new_meta_tasks = config["new_meta_tasks"]
-        new_meta_mappings = config["new_meta_mappings"]
-
-        # base datasets / memory_buffers
-        self.base_tasks = base_tasks
-        self.base_task_names = [_stringify_polynomial(t) for t in base_tasks]
-
-        # new datasets / memory_buffers
-        self.new_tasks = new_tasks
-        self.new_task_names = [_stringify_polynomial(t) for t in new_tasks]
-
-        self.all_base_tasks = self.base_tasks + self.new_tasks
-
-        self.base_meta_tasks = base_meta_tasks
-        self.base_meta_mappings = base_meta_mappings
-        self.base_meta_binary_funcs = base_meta_binary_funcs
-        self.all_base_meta_tasks = base_meta_tasks + base_meta_mappings + base_meta_binary_funcs
-        self.new_meta_tasks = new_meta_tasks
-        self.new_meta_mappings = new_meta_mappings
-        self.all_new_meta_tasks = new_meta_tasks + new_meta_mappings
-        self.all_meta_tasks = self.all_base_meta_tasks + self.all_new_meta_tasks
-        self.meta_dataset_cache = {t: {} for t in self.all_meta_tasks} # will cache datasets for a certain number of epochs
-                                                                       # both to speed training and to keep training targets
-                                                                       # consistent
-
-        self.all_initial_tasks = self.base_tasks + self.all_base_meta_tasks
-        self.all_new_tasks = self.new_tasks + self.all_new_meta_tasks
-
-        # think that's enough redundant variables?
-
-        self.meta_pairings_base, self.base_tasks_implied = _get_meta_pairings(
-            self.base_tasks, self.base_meta_tasks, self.base_meta_mappings,
-            self.base_meta_binary_funcs)
-
-        self.meta_pairings_full, self.full_tasks_implied = _get_meta_pairings(
-            self.base_tasks + self.new_tasks,
-            self.base_meta_tasks + self.new_meta_tasks,
-            self.base_meta_mappings + self.new_meta_mappings,
-            self.base_meta_binary_funcs)
-
-        self.base_tasks_implied_names = [_stringify_polynomial(t) for t in self.base_tasks_implied]
-        self.full_tasks_implied_names = [_stringify_polynomial(t) for t in self.full_tasks_implied]
-
-        self.memory_buffers = {_stringify_polynomial(t): memory_buffer(
-            self.memory_buffer_size, self.num_input,
-            self.num_output) for t in self.all_base_tasks + self.base_tasks_implied + [x for x in self.full_tasks_implied if x not in self.base_tasks_implied]}
-
-        self.all_tasks = self.all_initial_tasks + self.all_new_tasks 
-        self.all_tasks_with_implied = self.all_initial_tasks + self.all_new_tasks + self.full_tasks_implied
-        self.initial_base_tasks_with_implied = self.base_tasks + self.base_tasks_implied
-        self.all_base_tasks_with_implied = self.all_base_tasks + self.full_tasks_implied
-        self.all_initial_tasks_with_implied = self.all_initial_tasks + self.base_tasks_implied
-#        self.all_initial_tasks = self.all_initial_tasks + self.base_tasks_implied
-        self.num_tasks = num_tasks = len(self.all_tasks)
-
-        self.intified_base_tasks =  [_intify_polynomial(t) for t in self.initial_base_tasks_with_implied]
-        self.intified_new_tasks =  [_intify_polynomial(t) for t in self.all_base_tasks_with_implied]
-        max_sentence_len_obs = max(max([len(x) for x in self.intified_new_tasks]), max([len(x) for x in self.intified_base_tasks]))
-        self.max_sentence_len = min(config["max_sentence_len"], max_sentence_len_obs)
-#        print(self.max_sentence_len)
-        self.intified_base_tasks = [_pad(x, self.max_sentence_len, 0) if len(x) <= self.max_sentence_len else None for x in self.intified_base_tasks]
-        self.intified_new_tasks = [_pad(x, self.max_sentence_len, 0) if len(x) <= self.max_sentence_len else None for x in self.intified_new_tasks]
-
-        self.task_to_ints = {str_t: np.array([int_t]) if int_t is not None else None for str_t, int_t in zip(self.base_task_names + self.base_tasks_implied_names + self.new_task_names + self.full_tasks_implied_names, self.intified_base_tasks + self.intified_new_tasks)}
-
-#        for key, value in self.meta_pairings_base.items():
-#            print(key)
-#            print(value)
         
         # network
 
-        # base task input
-        input_size = config["num_input"]
-        output_size = config["num_output"]
+        # vision input
+        input_size = config["input_size"]
+        output_size = config["way"]
 
         self.base_input_ph = tf.placeholder(
-            tf.float32, shape=[None, input_size])
+            tf.float32, shape=[None] + input_size)
         self.base_target_ph = tf.placeholder(
             tf.float32, shape=[None, output_size])
 
@@ -255,40 +132,45 @@ class meta_model(object):
         num_hidden_hyper = config["num_hidden_hyper"]
         internal_nonlinearity = config["internal_nonlinearity"]
         output_nonlinearity = config["output_nonlinearity"]
-        input_processing_1 = slim.fully_connected(self.base_input_ph, num_hidden,
-                                                  activation_fn=internal_nonlinearity)
 
-        input_processing_2 = slim.fully_connected(input_processing_1, num_hidden,
-                                                  activation_fn=internal_nonlinearity)
 
-        processed_input = slim.fully_connected(input_processing_2, num_hidden_hyper,
-                                               activation_fn=internal_nonlinearity)
+        def _input_preprocessing(inputs):
+            return tf.image.resize_bilinear(inputs,
+                                            [224, 224])
+
+        preprocessed_inputs = _input_preprocessing(self.base_input_ph)
+
+        def _vision(preprocessed_inputs, reuse=True):
+            with tf.variable_scope("vision", reuse=reuse):
+                with slim.arg_scope(resnet_v1.resnet_arg_scope()):
+                    resnet_output, _ = resnet_v1.resnet_v1_50(preprocessed_inputs,
+                                                              is_training=False)
+                if not config["fine_tune_vision"]:
+                    resnet_output = tf.stop_gradient(resnet_output)
+                vision_result = slim.fully_connected(resnet_output, num_hidden_hyper,
+                                                     activation_fn=None)
+            return vision_result, resnet_output
+
+                
+        processed_input, resnet_output = _vision(preprocessed_inputs, 
+                                                       reuse=False)
+        tf.contrib.framework.init_from_checkpoint(
+            config['vision_checkpoint'],
+            {'resnet_v1_50/': 'vision/resnet_v1_50/'})
+
         self.processed_input = processed_input
 
-        all_target_processor_nontf = random_orthogonal(num_hidden_hyper)[:, :output_size + 1]
-        self.target_processor_nontf = all_target_processor_nontf[:, :output_size]
+        self.target_processor_nontf = random_orthogonal(num_hidden_hyper)[:, :output_size]
         self.target_processor = tf.get_variable('target_processor',
                                                 shape=[num_hidden_hyper, output_size],
                                                 initializer=tf.constant_initializer(self.target_processor_nontf))
+
         processed_targets = tf.matmul(self.base_target_ph, tf.transpose(self.target_processor))
 
         def _output_mapping(X):
             """hidden space mapped back to T/F output logits"""
             res = tf.matmul(X, self.target_processor)
             return res
-
-        # meta task input
-        self.meta_input_ph = tf.placeholder(tf.float32, shape=[None, num_hidden_hyper])
-        self.meta_input_2_ph = tf.placeholder(tf.float32, shape=[None, num_hidden_hyper])
-        self.meta_target_ph = tf.placeholder(tf.float32, shape=[None, num_hidden_hyper])
-        self.meta_class_ph = tf.placeholder(tf.float32, shape=[None, 1])
-        # last is for meta classification tasks
-
-        self.class_processor_nontf = all_target_processor_nontf[:, output_size:]
-        self.class_processor = tf.get_variable('class_processor',
-                                               shape=self.class_processor_nontf.shape,
-                                               initializer=tf.constant_initializer(self.class_processor_nontf))
-        processed_class = tf.matmul(self.meta_class_ph, tf.transpose(self.class_processor))
 
         # function embedding "guessing" network / meta network
         # {(emb_in, emb_out), ...} -> emb
@@ -321,118 +203,9 @@ class meta_model(object):
                 guess_embedding = tf.nn.dropout(guess_embedding, self.keep_prob_ph)
                 return guess_embedding
 
-
-        if config["separate_meta_task_network"]:
-            self.guess_base_function_emb = _meta_network(processed_input,
-                                                         processed_targets,
-                                                         reuse=False,
-                                                         subscope="base_tasks/")
-
-            self.guess_meta_t_function_emb = _meta_network(self.meta_input_ph,
-                                                           processed_class,
-                                                           reuse=False,
-                                                           subscope="meta_tasks/")
-
-            self.guess_meta_m_function_emb = _meta_network(self.meta_input_ph,
-                                                           self.meta_target_ph,
-                                                           subscope="meta_tasks/")
-        else:
-            self.guess_base_function_emb = _meta_network(processed_input,
-                                                         processed_targets,
-                                                         reuse=False)
-
-            self.guess_meta_t_function_emb = _meta_network(self.meta_input_ph,
-                                                           processed_class)
-            self.guess_meta_m_function_emb = _meta_network(self.meta_input_ph,
-                                                           self.meta_target_ph)
-
-
-        # for binary tasks 
-        def _combine_inputs(inputs_1, inputs_2, reuse=True):
-            with tf.variable_scope('meta/bi_combination', reuse=reuse):
-                c_input = tf.concat([inputs_1,
-                                     inputs_2], axis=-1)
-                c_input = tf.nn.dropout(c_input, self.keep_prob_ph)
-
-                ch_1 = slim.fully_connected(c_input, num_hidden_hyper,
-                                            activation_fn=internal_nonlinearity)
-                ch_1 = tf.nn.dropout(ch_1, self.keep_prob_ph)
-                ch_2 = slim.fully_connected(ch_1, num_hidden_hyper,
-                                            activation_fn=internal_nonlinearity)
-                ch_2 = tf.nn.dropout(ch_2, self.keep_prob_ph)
-                ch_3 = slim.fully_connected(ch_2, num_hidden_hyper,
-                                            activation_fn=internal_nonlinearity)
-                combined = tf.nn.dropout(ch_3, self.keep_prob_ph)
-                # also include direct inputs averaged
-                self.combination_weight = tf.get_variable('combination_weight',
-                                                          shape=[],
-                                                          initializer=tf.constant_initializer(0.))
-                c_w = tf.nn.sigmoid(self.combination_weight) 
-                combined = (c_w) * combined + (1.- c_w) * 0.5 * (inputs_1 + inputs_2) 
-                return combined 
-
-        self.combined_meta_inputs = _combine_inputs(self.meta_input_ph,
-                                                    self.meta_input_2_ph,
-                                                    reuse=False)
-
-        if config["separate_meta_task_network"]:
-            self.guess_meta_bf_function_emb = _meta_network(
-                self.combined_meta_inputs, self.meta_target_ph,
-                subscope="meta_tasks/")
-        else:
-            self.guess_meta_bf_function_emb = _meta_network(
-                self.combined_meta_inputs, self.meta_target_ph)
-    
-#        print(self.combined_meta_inputs)
-#        print(self.guess_base_function_emb)
-#        print(self.guess_meta_bf_function_emb)
-
-        # language processing: lang -> emb
-        num_hidden_language = config["num_hidden_language"]
-        num_lstm_layers = config["num_lstm_layers"]
-
-        self.lang_keep_ph = lang_keep_ph = tf.placeholder(tf.float32)
-        self.lang_keep_prob = 1. - config["lang_drop_prob"]
-        self.language_input_ph = tf.placeholder(
-            tf.int32, shape=[1, self.max_sentence_len])
-        with tf.variable_scope("word_embeddings", reuse=False):
-            self.word_embeddings = tf.get_variable(
-                "embeddings", shape=[self.vocab_size, num_hidden_language])
-        self.embedded_language = tf.nn.embedding_lookup(self.word_embeddings,
-                                                        self.language_input_ph)
-
-        def _language_network(embedded_language, reuse=True):
-            """Maps from language to a function embedding"""
-            with tf.variable_scope("language_processing"):
-                cells = [tf.nn.rnn_cell.LSTMCell(
-                    num_hidden_language) for _ in range(num_lstm_layers)]
-                stacked_cell = tf.nn.rnn_cell.MultiRNNCell(cells)
-
-                state = stacked_cell.zero_state(1, dtype=tf.float32)
-
-                for i in range(self.max_sentence_len):
-                    this_input = embedded_language[:, i, :]
-                    this_input = tf.nn.dropout(this_input,
-                                               lang_keep_ph)
-                    cell_output, state = stacked_cell(this_input, state)
-
-                cell_output = tf.nn.dropout(cell_output,
-                                           lang_keep_ph)
-                language_hidden = slim.fully_connected(
-                    cell_output, num_hidden_language,
-                    activation_fn=internal_nonlinearity)
-
-                language_hidden = tf.nn.dropout(language_hidden,
-                                           lang_keep_ph)
-
-                func_embeddings = slim.fully_connected(language_hidden,
-                                                       num_hidden_hyper,
-                                                       activation_fn=None)
-            return func_embeddings
-
-        self.language_function_emb = _language_network(self.embedded_language,
-                                                       False)
-
+        self.guess_base_function_emb = _meta_network(processed_input,
+                                                     processed_targets,
+                                                     reuse=False)
 
         # hyper_network: emb -> (f: emb -> emb)
         self.feed_embedding_ph = tf.placeholder(np.float32,
@@ -487,30 +260,9 @@ class meta_model(object):
                 hidden_biases.append(bfinal)
                 return hidden_weights, hidden_biases
 
-        if config["separate_meta_task_network"]:
-            self.base_task_params = _hyper_network(self.guess_base_function_emb,
-                                                   reuse=False, 
-                                                   subscope="/base_tasks")
-            self.base_lang_task_params = _hyper_network(self.language_function_emb, 
-                                                        subscope="/base_tasks")
-            self.meta_t_task_params = _hyper_network(self.guess_meta_t_function_emb,
-                                                     reuse=False, 
-                                                     subscope="/meta_tasks")
-            self.meta_m_task_params = _hyper_network(self.guess_meta_m_function_emb, 
-                                                     subscope="/meta_tasks")
-            self.meta_bf_task_params = _hyper_network(self.guess_meta_bf_function_emb, 
-                                                      subscope="/meta_tasks")
-            self.fed_emb_task_params = _hyper_network(self.feed_embedding_ph, 
-                                                      subscope="/base_tasks")
-
-        else:
-            self.base_task_params = _hyper_network(self.guess_base_function_emb,
-                                                   reuse=False)
-            self.base_lang_task_params = _hyper_network(self.language_function_emb)
-            self.meta_t_task_params = _hyper_network(self.guess_meta_t_function_emb)
-            self.meta_m_task_params = _hyper_network(self.guess_meta_m_function_emb)
-            self.meta_bf_task_params = _hyper_network(self.guess_meta_bf_function_emb)
-            self.fed_emb_task_params = _hyper_network(self.feed_embedding_ph)
+        self.base_task_params = _hyper_network(self.guess_base_function_emb,
+                                               reuse=False)
+        self.fed_emb_task_params = _hyper_network(self.feed_embedding_ph)
 
         # task network
         def _task_network(task_params, processed_input):
@@ -527,46 +279,27 @@ class meta_model(object):
         self.base_raw_output = _task_network(self.base_task_params,
                                              processed_input)
         self.base_output = _output_mapping(self.base_raw_output)
-
-        self.base_lang_raw_output = _task_network(self.base_lang_task_params,
-                                             processed_input)
-        self.base_lang_output = _output_mapping(self.base_lang_raw_output)
+        self.base_output_argmax = tf.argmax(self.base_output, axis=-1)
 
         self.base_raw_output_fed_emb = _task_network(self.fed_emb_task_params,
                                                      processed_input)
         self.base_output_fed_emb = _output_mapping(self.base_raw_output_fed_emb)
+        self.base_output_fed_emb_argmax = tf.argmax(self.base_output_fed_emb, 
+                                                    axis=-1)
 
-        self.meta_t_raw_output = _task_network(self.meta_t_task_params,
-                                               self.meta_input_ph)
-        self.meta_t_output = tf.nn.sigmoid(self.meta_t_raw_output)
+        # loss
+        loss_fn = tf.nn.softmax_cross_entropy_with_logits
+        target_argmax = tf.argmax(self.base_target_ph, axis=-1)
 
-        self.meta_m_output = _task_network(self.meta_m_task_params,
-                                           self.meta_input_ph)
-
-        self.meta_bf_output = _task_network(self.meta_bf_task_params,
-                                            self.combined_meta_inputs)
-
-        self.base_loss = tf.square(self.base_output - self.base_target_ph)
+        self.base_loss = loss_fn(logits=self.base_output, labels=self.base_target_ph)
         self.total_base_loss = tf.reduce_mean(self.base_loss)
+        self.base_accuracy = tf.reduce_mean(tf.equal(self.base_output_argmax, target_argmax))
 
-        self.base_lang_loss = tf.square(self.base_lang_output - self.base_target_ph)
-        self.total_base_lang_loss = tf.reduce_mean(self.base_lang_loss)
-
-        self.base_fed_emb_loss = tf.square(
-            self.base_output_fed_emb - self.base_target_ph)
+        self.base_fed_emb_loss = loss_fn(logits=self.base_output_fed_emb, 
+                                         labels=self.base_target_ph)
         self.total_base_fed_emb_loss = tf.reduce_mean(self.base_fed_emb_loss)
-
-        self.meta_t_loss = tf.reduce_sum(
-            tf.square(self.meta_t_output - processed_class), axis=1)
-        self.total_meta_t_loss = tf.reduce_mean(self.meta_t_loss)
-
-        self.meta_m_loss = tf.reduce_sum(
-            tf.square(self.meta_m_output - self.meta_target_ph), axis=1)
-        self.total_meta_m_loss = tf.reduce_mean(self.meta_m_loss)
-
-        self.meta_bf_loss = tf.reduce_sum(
-            tf.square(self.meta_bf_output - self.meta_target_ph), axis=1)
-        self.total_meta_bf_loss = tf.reduce_mean(self.meta_bf_loss)
+        self.base_accuracy = tf.reduce_mean(
+            tf.equal(self.base_output_fed_emb_argmax, target_argmax))
 
         if config["optimizer"] == "Adam":
             optimizer = tf.train.AdamOptimizer(self.lr_ph)
@@ -576,10 +309,7 @@ class meta_model(object):
             raise ValueError("Unknown optimizer: %s" % config["optimizer"])
 
         self.base_train = optimizer.minimize(self.total_base_loss)
-        self.base_lang_train = optimizer.minimize(self.total_base_lang_loss)
-        self.meta_t_train = optimizer.minimize(self.total_meta_t_loss)
-        self.meta_m_train = optimizer.minimize(self.total_meta_m_loss)
-        self.meta_bf_train = optimizer.minimize(self.total_meta_bf_loss)
+        self.base_fed_emb_train = optimizer.minimize(self.total_base_fed_emb_loss)
 
         # Saver
         self.saver = tf.train.Saver()
@@ -589,35 +319,14 @@ class meta_model(object):
         sess_config.gpu_options.allow_growth = True
         self.sess = tf.Session(config=sess_config)
         self.sess.run(tf.global_variables_initializer())
-        self.fill_buffers(num_data_points=config["memory_buffer_size"],
-                          include_new=True)
-
-        self.refresh_meta_dataset_cache()
+        exit()
 
 
-    def fill_buffers(self, num_data_points=1, include_new=False):
-        """Add new "experiences" to memory buffers."""
-        if include_new:
-            this_tasks = self.all_base_tasks_with_implied
-        else:
-            this_tasks = self.initial_base_tasks_with_implied
-        for t in this_tasks:
-            buff = self.memory_buffers[_stringify_polynomial(t)]
-            x_data = np.zeros([num_data_points, self.config["num_input"]])
-            y_data = np.zeros([num_data_points, self.config["num_output"]])
-            for point_i in range(num_data_points):
-                point = t.family.sample_point(val_range=self.config["point_val_range"])
-                x_data[point_i, :] = point
-                y_data[point_i, :] = t.evaluate(point)
-            buff.insert(x_data, y_data)
-
-
-    def _random_guess_mask(self, dataset_length, meta_batch_size=None):
-        if meta_batch_size is None:
-            meta_batch_size = config["meta_batch_size"]
+    def _default_guess_mask(self):
+        way = self.config["way"]
+        shot = self.config["shot"]
         mask = np.zeros(dataset_length, dtype=np.bool)
-        indices = np.random.permutation(dataset_length)[:meta_batch_size]
-        mask[indices] = True
+        mask[:way * shot] = True
         return mask
 
 
@@ -1182,26 +891,36 @@ class meta_model(object):
                         fout_sweep.write(swept_losses)
 
 
+
+## data loading
+
+#dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
+#                                    way_num=config["way"],
+#                                    episode_test_sample_num=15)
+#
+#dataloader.load_list(phase='all')
+
+#batch = dataloader.get_batch(phase='train', idx=0)
+#for i in range(len(batch)):
+#    print(batch[i].shape)
+#
+#exit()
+
 ## running stuff
 
 for run_i in range(config["run_offset"], config["run_offset"]+config["num_runs"]):
+    model = meta_model(config)
+
     np.random.seed(run_i)
     tf.set_random_seed(run_i)
-    config["base_tasks"] = [poly_fam.sample_polynomial(coefficient_sd=config["poly_coeff_sd"]) for _ in range(config["num_base_tasks"])]
-    config["new_tasks"] = [poly_fam.sample_polynomial(coefficient_sd=config["poly_coeff_sd"]) for _ in range(config["num_new_tasks"])]
-    config["base_task_names"] = [x.to_symbols() for x in config["base_tasks"]] 
-    config["new_task_names"] = [x.to_symbols() for x in config["new_tasks"]] 
-                            
-# tasks implied by meta mappings, network will also be trained on these  
-    config["implied_base_tasks"] = [] 
-    config["implied_new_tasks"] = []
+
+    model = meta_model(config)
 
     filename_prefix = config["output_dir"] + "run%i" % run_i
     print("Now running %s" % filename_prefix)
     _save_config(filename_prefix + "_config.csv", config)
 
 
-    model = meta_model(config)
 #    model.save_embeddings(filename=filename_prefix + "_init_embeddings.csv",
 #                          include_new=False)
     if config["restore_checkpoint_path"] is not None:
