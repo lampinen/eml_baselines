@@ -36,7 +36,7 @@ config = {
     "num_hidden": 128,
     "num_hidden_hyper": 512,
 
-    "optimizer": "Adam",
+    "optimizer": "RMSProp",
 
     "init_learning_rate": 1e-4,
 
@@ -62,7 +62,7 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results_%ishot_%iway/",
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results4_%ishot_%iway/",
     "eval_every": 500, 
     "eval_batches": 50,
     "big_eval_every": 2000, 
@@ -491,7 +491,7 @@ class meta_model(object):
 
 dataloader = MiniImageNetDataLoader(shot_num=config["shot"], 
                                     way_num=config["way"],
-                                    episode_test_sample_num=15)
+                                    episode_test_sample_num=config["test_sample_num"])
 
 dataloader.generate_data_list(phase='train')
 dataloader.generate_data_list(phase='val')
