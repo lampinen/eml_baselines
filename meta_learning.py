@@ -1,7 +1,3 @@
-from __future__ import print_function
-from __future__ import absolute_import
-from __future__ import division
-
 import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
@@ -36,7 +32,7 @@ config = {
     "num_hidden": 128,
     "num_hidden_hyper": 512,
 
-    "optimizer": "RMSProp",
+    "optimizer": "Adam",
 
     "init_learning_rate": 1e-4,
 
@@ -62,8 +58,8 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results4_%ishot_%iway/",
-    "eval_every": 500, 
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results_%ishot_%iway/",
+    "eval_every": 200, 
     "eval_batches": 50,
     "big_eval_every": 2000, 
     "big_eval_batches": 200,
