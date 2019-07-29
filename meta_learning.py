@@ -21,7 +21,7 @@ config = {
 
     "vision_checkpoint": "./resnet_v1_50.ckpt",
     "fine_tune_vision": True,
-    "input_size": [84, 84, 3],
+    "input_size": [224, 224, 3],
 
     "way": 5, # how many classes 
     "shot": 5, # how many shots
@@ -34,7 +34,7 @@ config = {
 
     "optimizer": "Adam",
 
-    "init_learning_rate": 1e-4,
+    "init_learning_rate": 5e-7,
 
     "lr_decay": 0.85,
 
@@ -58,7 +58,7 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet/results_%ishot_%iway/",
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_224/results5_%ishot_%iway/",
     "eval_every": 200, 
     "eval_batches": 50,
     "big_eval_every": 2000, 
@@ -146,7 +146,10 @@ class meta_model(object):
             return tf.image.resize_bilinear(inputs,
                                             [224, 224])
 
-        preprocessed_inputs = _input_preprocessing(self.base_input_ph)
+        if input_size[0] != 224 or input_size[1] != 224:
+            preprocessed_inputs = _input_preprocessing(self.base_input_ph)
+        else:
+            preprocessed_inputs = self.base_input_ph
 
         def _vision(preprocessed_inputs, reuse=True):
             with tf.variable_scope("vision", reuse=reuse):
