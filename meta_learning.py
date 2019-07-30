@@ -20,8 +20,8 @@ config = {
     "num_runs": 1,
 
     "vision_checkpoint": "./resnet_v1_50.ckpt",
-    "fine_tune_vision": True,
-    "input_size": [224, 224, 3],
+    "fine_tune_vision": False,
+    "input_size": [84, 84, 3],
 
     "way": 5, # how many classes 
     "shot": 5, # how many shots
@@ -32,14 +32,15 @@ config = {
     "num_hidden": 128,
     "num_hidden_hyper": 512,
 
+    "M_max_pool": True,  # whether to max or average across examples in M
     "optimizer": "Adam",
 
-    "init_learning_rate": 5e-7,
+    "init_learning_rate": 3e-6,
 
-    "lr_decay": 0.85,
+    "lr_decay": 0.8,
 
-    "lr_decays_every": 500,
-    "min_learning_rate": 3e-8,
+    "lr_decays_every": 250,
+    "min_learning_rate": 1e-8,
 
     "max_epochs": 500000,
     "batches_per_epoch": 100,
@@ -58,7 +59,7 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_224/results5_%ishot_%iway/",
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_redux/results_%ishot_%iway/",
     "eval_every": 200, 
     "eval_batches": 50,
     "big_eval_every": 2000, 
@@ -205,7 +206,10 @@ class meta_model(object):
                 gh_2 = slim.fully_connected(gh_1, num_hidden_hyper,
                                             activation_fn=internal_nonlinearity)
                 gh_2 = tf.nn.dropout(gh_2, self.keep_prob_ph)
-                gh_2b = tf.reduce_max(gh_2, axis=0, keep_dims=True)
+                if config["M_max_pool"]:
+                    gh_2b = tf.reduce_max(gh_2, axis=0, keep_dims=True)
+                else:
+                    gh_2b = tf.reduce_mean(gh_2, axis=0, keep_dims=True)
                 gh_3 = slim.fully_connected(gh_2b, num_hidden_hyper,
                                             activation_fn=internal_nonlinearity)
                 gh_3 = tf.nn.dropout(gh_3, self.keep_prob_ph)
