@@ -19,9 +19,9 @@ config = {
     "run_offset": 0,
     "num_runs": 1,
 
-    "vision_checkpoint": "./resnet_v1_50.ckpt",
-    "fine_tune_vision": False,
-    "input_size": [84, 84, 3],
+    "vision_checkpoint": None, #"./resnet_v1_50.ckpt",
+    "fine_tune_vision": True,
+    "input_size": [224, 224, 3],
 
     "way": 5, # how many classes 
     "shot": 5, # how many shots
@@ -30,7 +30,7 @@ config = {
                           
 
     "num_hidden": 128,
-    "num_hidden_hyper": 512,
+    "num_hidden_hyper": 1024,
 
     "M_max_pool": True,  # whether to max or average across examples in M
     "optimizer": "Adam",
@@ -50,8 +50,8 @@ config = {
                              # but NOT task or input/output at present. Note
                              # that because of multiplicative effects and depth
                              # impact can be dramatic.
-
-    "task_weight_weight_mult": 1., # not a typo, the init range of the final
+    "train_vision_drop_prob": 0.66, # for vision output
+    "task_weight_weight_mult": 0.8, # not a typo, the init range of the final
                                    # hyper weights that generate the task
                                    # parameters. 
 
@@ -59,7 +59,7 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_redux/results_%ishot_%iway/",
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_224_redux/results_%ishot_%iway/",
     "eval_every": 200, 
     "eval_batches": 50,
     "big_eval_every": 2000, 
@@ -114,6 +114,7 @@ class meta_model(object):
         self.dataset_test_portion = way * test_sample_num 
         self.num_output = way 
         self.tkp = 1. - config["train_drop_prob"] # drop prob -> keep prob
+        self.tvkp = 1. - config["train_vision_drop_prob"] # drop prob -> keep prob
         self.train_idx = 0 
         self.eval_idx = {"train": 0, "val": 0, "test": 0}
 
@@ -136,6 +137,7 @@ class meta_model(object):
 
         self.lr_ph = tf.placeholder(tf.float32)
         self.keep_prob_ph = tf.placeholder(tf.float32) # dropout keep prob
+        self.vision_keep_prob_ph = tf.placeholder(tf.float32) # for vision output 
 
         num_hidden = config["num_hidden"]
         num_hidden_hyper = config["num_hidden_hyper"]
@@ -156,10 +158,12 @@ class meta_model(object):
             with tf.variable_scope("vision", reuse=reuse):
                 with slim.arg_scope(resnet_v1.resnet_arg_scope()):
                     resnet_output, _ = resnet_v1.resnet_v1_50(preprocessed_inputs,
-                                                              is_training=False)
+                                                              is_training=True)
                 if not config["fine_tune_vision"]:
                     resnet_output = tf.stop_gradient(resnet_output)
                 resnet_output = tf.squeeze(resnet_output, axis=[1, 2])
+                resnet_output = tf.nn.dropout(resnet_output,
+                                              keep_prob=self.vision_keep_prob_ph)
                 vision_result = slim.fully_connected(resnet_output, num_hidden_hyper,
                                                      activation_fn=None)
             return vision_result, resnet_output
@@ -167,9 +171,10 @@ class meta_model(object):
                 
         processed_input, resnet_output = _vision(preprocessed_inputs, 
                                                        reuse=False)
-        tf.contrib.framework.init_from_checkpoint(
-            config['vision_checkpoint'],
-            {'resnet_v1_50/': 'vision/resnet_v1_50/'})
+        if config["vision_checkpoint"]:
+            tf.contrib.framework.init_from_checkpoint(
+                config['vision_checkpoint'],
+                {'resnet_v1_50/': 'vision/resnet_v1_50/'})
 
         self.processed_input = processed_input
 
@@ -359,6 +364,7 @@ class meta_model(object):
             self.guess_input_mask_ph: self._default_guess_mask(),
             self.base_target_ph: targets,
             self.keep_prob_ph: self.tkp,
+            self.vision_keep_prob_ph: self.tvkp,
             self.lr_ph: lr
         }
         self.sess.run(self.base_train, feed_dict=feed_dict)
@@ -372,7 +378,8 @@ class meta_model(object):
             self.base_input_ph: vision_inputs,
             self.guess_input_mask_ph: self._default_guess_mask(),
             self.base_target_ph: targets,
-            self.keep_prob_ph: 1.
+            self.keep_prob_ph: 1.,
+            self.vision_keep_prob_ph: 1.,
         }
         fetches = [self.total_base_loss, self.base_accuracy]
         res = self.sess.run(fetches, feed_dict=feed_dict)
@@ -415,7 +422,8 @@ class meta_model(object):
             self.base_input_ph: vision_inputs,
             self.guess_input_mask_ph: self._default_guess_mask(),
             self.base_target_ph: targets,
-            self.keep_prob_ph: 1.
+            self.keep_prob_ph: 1.,
+            self.vision_keep_prob_ph: 1.,
         }
         res = self.sess.run(self.guess_base_function_emb, feed_dict=feed_dict)
         return res
