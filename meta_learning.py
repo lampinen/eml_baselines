@@ -50,7 +50,8 @@ config = {
                              # but NOT task or input/output at present. Note
                              # that because of multiplicative effects and depth
                              # impact can be dramatic.
-    "train_vision_drop_prob": 0.66, # for vision output
+    "train_vision_drop_prob": 0.5, # for vision output
+    "start_vision_drop_epoch": 400, 
     "task_weight_weight_mult": 0.8, # not a typo, the init range of the final
                                    # hyper weights that generate the task
                                    # parameters. 
@@ -59,7 +60,7 @@ config = {
     # if a restore checkpoint path is provided, will restore from it instead of
     # running the initial training phase
     "restore_checkpoint_path": None, 
-    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_224_redux/results_%ishot_%iway/",
+    "output_dir": "/mnt/fs4/lampinen/eml_baselines/mini_imagenet_224_redux/results6_%ishot_%iway/",
     "eval_every": 200, 
     "eval_batches": 50,
     "big_eval_every": 2000, 
@@ -355,7 +356,7 @@ class meta_model(object):
         return mask
 
 
-    def base_train_step(self, batch, lr):
+    def base_train_step(self, batch, lr, with_vision_dropout=True):
         train_img, train_label, test_img, test_label = batch
         vision_inputs = np.concatenate([train_img, test_img], axis=0)
         targets = np.concatenate([train_label, test_label], axis=0)
@@ -364,7 +365,7 @@ class meta_model(object):
             self.guess_input_mask_ph: self._default_guess_mask(),
             self.base_target_ph: targets,
             self.keep_prob_ph: self.tkp,
-            self.vision_keep_prob_ph: self.tvkp,
+            self.vision_keep_prob_ph: self.tvkp if with_vision_dropout else 1.,
             self.lr_ph: lr
         }
         self.sess.run(self.base_train, feed_dict=feed_dict)
@@ -476,7 +477,8 @@ class meta_model(object):
                 for batch_i in range(batches_per_epoch):
                     batch = self.dataloader.get_batch(phase="train", 
                                                       idx=self.train_idx)
-                    self.base_train_step(batch, learning_rate)
+                    self.base_train_step(batch, learning_rate, 
+                                         with_vision_dropout=epoch > config["start_vision_drop_epoch"])
                     self.train_idx += 1
                     if self.train_idx >= self.idx_limit["train"]: 
                         self.train_idx = 0
